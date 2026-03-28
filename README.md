@@ -2,14 +2,7 @@
 
 ADS-B radar shared over a [Reticulum](https://reticulum.network) mesh. Senders read aircraft from a local dump1090 or a public API and broadcast filtered frames over encrypted RNS links. Receivers display a merged terminal radar scope and discover senders automatically via announce.
 
-```
-  dump1090 / adsb.im                    laptop / Pi / desktop
-  ┌─────────────────────┐               ┌──────────────────────┐
-  │  adsb-sender        │               │  adsb-receiver       │
-  │  announces coverage │──── RNS ─────▶│  discovers senders   │
-  │  filters per-link   │               │  merges aircraft DB  │
-  └─────────────────────┘               └──────────────────────┘
-```
+<img src="docs/demo.gif" alt="adsb-radar live scope demo" width="900">
 
 Works over LoRa (RNode), TCP, WiFi AutoInterface, I2P, or any Reticulum transport.
 
