@@ -345,6 +345,8 @@ services:
         --home-lon   -87.63
         --home-range 150
         --config     /config/receiver.conf
+    environment:
+      TERM: xterm-256color
     volumes:
       - ./docker/node-reticulum.conf:/root/.reticulum/config:ro
       - receiver-config:/config
