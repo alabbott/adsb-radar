@@ -66,6 +66,12 @@ _link_views_lock = threading.Lock()
 _link_view_times = {}
 _link_view_times_lock = threading.Lock()
 
+# ── Announce state (set in main, read by on_link_closed) ─────────────────────
+# Mutable container so the callback can reset the main-loop timer.
+_dest = None
+_app_data = None
+_last_announce = [0.0]  # [timestamp] — single-element list for mutability from callback
+
 
 # ── RNS callbacks ─────────────────────────────────────────────────────────────
 
@@ -86,6 +92,13 @@ def on_link_closed(link):
     with _link_view_times_lock:
         _link_view_times.pop(id(link), None)
     log.info("Link DOWN %s…  (%d total)", link.hash.hex()[:8], _link_count())
+    # Re-announce immediately so receivers can find a fresh path when
+    # reconnecting.  Without this, the path can sit stale on the network for up
+    # to ANNOUNCE_INTERVAL_LINKED (300 s), causing "no path" on reconnect.
+    if _dest is not None:
+        _dest.announce(app_data=_app_data)
+        _last_announce[0] = time.time()
+        log.info("Re-announced after link down.")
 
 
 def on_view_request(message, packet):
@@ -301,11 +314,15 @@ def main():
     log.info("Center           : (%s, %s)  range: %snm", sender_lat, sender_lon, sender_range)
     log.info("Name             : %s", args.name)
 
+    global _dest, _app_data
+    _dest = dest
+    _app_data = app_data
+
     dest.announce(app_data=app_data)
     log.info("Initial announce sent.")
     log.info("Broadcasting every %ss — waiting for receivers …", args.interval)
 
-    last_announce = time.time()
+    _last_announce[0] = time.time()
     fetch_failures = 0
 
     while True:
@@ -341,9 +358,9 @@ def main():
         announce_interval = (
             ANNOUNCE_INTERVAL_IDLE if _link_count() == 0 else ANNOUNCE_INTERVAL_LINKED
         )
-        if time.time() - last_announce >= announce_interval:
+        if time.time() - _last_announce[0] >= announce_interval:
             dest.announce(app_data=app_data)
-            last_announce = time.time()
+            _last_announce[0] = time.time()
             log.info("Re-announced destination.")
 
         # Sleep remainder of interval
