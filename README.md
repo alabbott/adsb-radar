@@ -8,6 +8,49 @@ Works over LoRa (RNode), TCP, WiFi AutoInterface, I2P, or any Reticulum transpor
 
 ---
 
+## Quick start
+
+**Option A — Join the Chicagoland Reticulum Network**
+
+Connect to the [CRN](https://reticulum.world/) (a public Reticulum hub) and run the receiver. It discovers any senders already on the mesh — no local sender or Docker cluster needed.
+
+```bash
+# ~/.reticulum/config — add one interface
+[[CRN]]
+  type              = TCPClientInterface
+  interface_enabled = True
+  target_host       = rns.noderage.org
+  target_port       = 4242
+```
+
+```bash
+adsb-receiver --home-lat YOUR_LAT --home-lon YOUR_LON
+```
+
+Senders announce themselves periodically — on first connect it can take 5–10 minutes (or longer) for all nearby senders to appear. Known senders are cached in `receiver.conf` after first contact and reconnect immediately on subsequent runs.
+
+See [Reticulum](#reticulum) for full interface options.
+
+**Option B — Local simulation cluster**
+
+Run 19 API-fed senders covering the Great Lakes basin on an isolated Docker bridge. No hardware, no CRN connection, no traffic leaves the machine.
+
+```bash
+docker compose up -d transport \
+  sender-chicago sender-illinois-w sender-wisconsin sender-michigan \
+  sender-indiana sender-ohio sender-cincinnati \
+  sender-minnesota sender-iowa sender-missouri sender-michigan-up \
+  sender-detroit sender-northern-michigan sender-sault \
+  sender-lake-superior sender-duluth \
+  sender-pittsburgh sender-buffalo sender-rochester
+
+docker compose run --rm -it receiver
+```
+
+The receiver must run as a container — a host-side `adsb-receiver` cannot reach the Docker senders unless the networks are bridged. See [Docker cluster](#docker-cluster) for details.
+
+---
+
 ## Install
 
 ```bash
@@ -225,9 +268,9 @@ Remove: `sudo systemctl disable --now adsb_sender && sudo rm /etc/systemd/system
 
 `docker-compose.yml` runs 19 senders covering the Great Lakes basin plus a shared Reticulum transport node. Senders pull from the public adsb.lol API — no feeder account or local ADS-B hardware needed.
 
-**Local simulation** — senders and receiver are isolated to the Docker bridge network; no traffic leaves the machine. No `.env` needed.
+**Default (isolated)** — all containers run on the `adsb-mesh` Docker bridge. No traffic leaves the machine and no `.env` is needed. The receiver must run as a container (`docker compose run --rm -it receiver`) — a host-side `adsb-receiver` cannot reach the Docker senders unless the networks are explicitly bridged.
 
-**Live mesh** — set `RETICULUM_HOST` in `.env` to uplink the cluster to a Reticulum TCP hub.
+**Live mesh** — set `RETICULUM_HOST` in `.env` to uplink the transport container to a Reticulum hub. This makes all 19 simulated senders visible to every node on that network. Only enable this if you intend to share your senders publicly; connecting a simulation cluster to a shared mesh unintentionally will flood it with API-fetched data.
 
 ### Running the cluster
 
@@ -243,21 +286,13 @@ docker compose up -d transport \
   sender-pittsburgh sender-buffalo sender-rochester
 ```
 
-Run the interactive receiver (requires a TTY):
+Run the interactive receiver inside the cluster (requires a TTY):
 
 ```bash
 docker compose run --rm -it receiver
 ```
 
-Bridge to the live mesh ([Chicagoland Reticulum Network](https://reticulum.world/)) (CRN):
-
-```bash
-cp .env.example .env
-# RETICULUM_HOST=rns.noderage.org is pre-filled in .env.example
-docker compose up -d transport
-```
-
-The transport container runs `rnsd` with a `TCPServerInterface` on port 7777 (internal) and, when `RETICULUM_HOST` is set, a `TCPClientInterface` uplink to your hub.
+The transport container runs `rnsd` with a `TCPServerInterface` on the internal bridge and, when `RETICULUM_HOST` is set, a `TCPClientInterface` uplink to the configured hub.
 
 ### Coverage
 
@@ -312,7 +347,7 @@ Community backup servers (any one works): `rns.chicagonomad.net:4242`, `rns.faul
   peers             = hm2arylcoexb5h3y6kbgy776dfsqkl4tzb72foly2emdldhjbtq.b32.i2p
 ```
 
-This connects to the CRN. The simulation senders in this project's Docker cluster announce on the CRN, so pointing a receiver here will show them immediately without running any local infrastructure.
+This connects to the CRN. Any adsb-radar senders on the network will be discovered automatically by the receiver.
 
 **LoRa via RNode** (`/dev/ttyUSB0`):
 
