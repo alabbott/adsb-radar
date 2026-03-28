@@ -63,9 +63,13 @@
 x-sender-defaults: &sender-defaults
   build: .
   image: adsb-lora
+  entrypoint: ["/bin/sh", "/docker/sender-entrypoint.sh"]
   volumes:
-    - ./docker/node-reticulum.conf:/root/.reticulum/config:ro
+    - ./docker/sender-entrypoint.sh:/docker/sender-entrypoint.sh:ro
     - sender-identities:/identities
+  environment:
+    RETICULUM_HOST: "${RETICULUM_HOST:-}"
+    RETICULUM_PORT: "${RETICULUM_PORT:-4242}"
   networks:
     - adsb-mesh
   depends_on:
