@@ -49,4 +49,4 @@ else
 EOF
 fi
 
-exec adsb-sender "$@"
+exec "$@"
