@@ -83,7 +83,7 @@ services:
       - ./docker/transport-entrypoint.sh:/docker/transport-entrypoint.sh:ro
       - transport-rns-storage:/root/.reticulum/storage
     environment:
-      RETICULUM_HOST: "${RETICULUM_HOST:?set RETICULUM_HOST in .env}"
+      RETICULUM_HOST: "${RETICULUM_HOST:-}"
       RETICULUM_PORT: "${RETICULUM_PORT:-4242}"
     networks:
       - adsb-mesh
