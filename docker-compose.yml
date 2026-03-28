@@ -1,0 +1,363 @@
+# ── adsb-lora regional coverage cluster ───────────────────────────────────────
+#
+# Topology:
+#
+#   [reticulum_host] ──TCP──┐
+#                            ▼
+#   Docker bridge (adsb-mesh)
+#     transport       — rnsd bridging external TCP ↔ internal TCPServer
+#
+#   19 regional senders with 75-100nm radii covering the entire Great Lakes
+#     basin with no coverage gaps — Illinois, Indiana, Iowa, Michigan (lower +
+#     UP), Minnesota, Missouri, Ohio, Wisconsin, western Pennsylvania,
+#     western/central New York, and all five Great Lakes.
+#
+#   sender-chicago          — Chicago metro core, 100nm (MKE, RFD, SBN, Gary)
+#   sender-illinois-w       — Western Illinois, 75nm (Peoria, Springfield, QC)
+#   sender-wisconsin        — All Wisconsin, 100nm (GRB, MSN, EAU, LSE)
+#   sender-michigan         — Lower Michigan, 100nm (GRR, LAN, TVC, FNT)
+#   sender-indiana          — Indiana, 75nm (IND, FWA, SBN, EVV)
+#   sender-ohio             — Ohio, 80nm (CMH, CLE, DAY, TOL, CAK)
+#   sender-cincinnati       — SW Ohio / N Kentucky, 75nm (CVG, DAY, LEX)
+#   sender-minnesota        — Minnesota, 80nm (MSP, RST)
+#   sender-iowa             — Iowa, 75nm (DSM, CID, DBQ)
+#   sender-missouri         — Missouri / S Illinois, 75nm (STL)
+#   sender-michigan-up      — Upper Peninsula Michigan, 75nm (MQT, IMT, CIU)
+#   sender-detroit          — SE Michigan / Detroit, 100nm (DTW, YQG, Ann Arbor)  [gap fill]
+#   sender-northern-michigan— N Lower Michigan / Straits, 80nm (TVC, PLN, ALN)  [gap fill]
+#   sender-sault            — Eastern UP / Sault, 80nm (SSM, ANJ)               [gap fill]
+#   sender-lake-superior    — Central Lake Superior, 75nm (IWD, ASX, CMX)       [gap fill]
+#   sender-duluth           — Duluth / W Lake Superior, 80nm (DLH, SUW)         [gap fill]
+#   sender-pittsburgh       — Pittsburgh / Lake Erie, 100nm (PIT, ERI, YNG)     [gap fill]
+#   sender-buffalo          — Buffalo / W New York, 80nm (BUF, IAG, NF)         [gap fill]
+#   sender-rochester        — Rochester / Lake Ontario, 75nm (ROC, SYR)         [gap fill]
+#
+#   receiver — interactive (docker compose run --rm -it receiver)
+#              home at Chicago center, home-range 1000nm
+#
+# Coverage reference (nm from Chicago center 41.88°N, -87.63°W):
+#   MKE  +43.042, -087.906   ~75nm N   (inside chicago 100nm)
+#   GRB  +44.485, -088.130   ~170nm N  (wisconsin sender)
+#   DTW  +42.212, -083.353   ~231nm E  (michigan sender)
+#   GRR  +42.881, -085.523   ~179nm E  (michigan sender)
+#   TVC  +44.741, -085.582   ~295nm NE (michigan sender)
+#   IND  +39.717, -086.294   ~151nm SE (indiana sender)
+#   CMH  +39.998, -082.892   ~292nm E  (ohio sender)
+#   CLE  +41.412, -081.850   ~332nm E  (ohio sender)
+#   MSP  +44.880, -093.217   ~342nm NW (minnesota sender)
+#   DSM  +41.534, -093.663   ~349nm W  (iowa sender)
+#   STL  +38.748, -090.370   ~255nm SW (missouri sender)
+#   MQT  +46.354, -087.395   ~330nm N  (michigan-up sender)
+#
+# Usage:
+#   cp .env.example .env   # set RETICULUM_HOST
+#   docker compose up -d transport \
+#     sender-chicago sender-illinois-w sender-wisconsin sender-michigan \
+#     sender-indiana sender-ohio sender-cincinnati \
+#     sender-minnesota sender-iowa sender-missouri sender-michigan-up \
+#     sender-detroit sender-northern-michigan sender-sault \
+#     sender-lake-superior sender-duluth \
+#     sender-pittsburgh sender-buffalo sender-rochester
+#   docker compose run --rm -it receiver
+
+x-sender-defaults: &sender-defaults
+  build: .
+  image: adsb-lora
+  volumes:
+    - ./docker/node-reticulum.conf:/root/.reticulum/config:ro
+    - sender-identities:/identities
+  networks:
+    - adsb-mesh
+  depends_on:
+    - transport
+  restart: unless-stopped
+
+services:
+
+  # ── Transport / bridge node ──────────────────────────────────────────────────
+  transport:
+    build: .
+    image: adsb-lora
+    entrypoint: ["/bin/sh", "/docker/transport-entrypoint.sh"]
+    volumes:
+      - ./docker/transport-entrypoint.sh:/docker/transport-entrypoint.sh:ro
+      - transport-rns-storage:/root/.reticulum/storage
+    environment:
+      RETICULUM_HOST: "${RETICULUM_HOST:?set RETICULUM_HOST in .env}"
+      RETICULUM_PORT: "${RETICULUM_PORT:-4242}"
+    networks:
+      - adsb-mesh
+    restart: unless-stopped
+
+  # ── Core region ───────────────────────────────────────────────────────────────
+  # Chicago 100nm: covers all Chicagoland, Milwaukee, Rockford, Gary, South Bend,
+  # Kalamazoo-edge, Peoria-edge, and northwest Indiana.
+
+  sender-chicago:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/41.88/-87.63/100"
+        --lat   41.88 --lon -87.63 --range 100
+        --name  adsb-chi
+        --identity /identities/chicago
+
+  # Western Illinois 75nm: Peoria, Springfield, Decatur, Quad Cities/Davenport,
+  # Galesburg, Champaign. Fills the gap west of Chicago sender.
+
+  sender-illinois-w:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/41.00/-89.50/75"
+        --lat   41.00 --lon -89.50 --range 75
+        --name  adsb-ilw
+        --identity /identities/illinois-w
+
+  # ── Wisconsin ────────────────────────────────────────────────────────────────
+  # Central WI 100nm: covers entire state — Green Bay, Madison, Eau Claire,
+  # Wausau, La Crosse, Appleton, Oshkosh, Superior edge.
+
+  sender-wisconsin:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/44.50/-89.50/100"
+        --lat   44.50 --lon -89.50 --range 100
+        --name  adsb-wi
+        --identity /identities/wisconsin
+
+  # ── Michigan lower peninsula ─────────────────────────────────────────────────
+  # Central MI 100nm: covers entire lower peninsula — Detroit, Grand Rapids,
+  # Lansing, Flint, Saginaw, Traverse City, Kalamazoo, Ann Arbor, Toledo edge.
+
+  sender-michigan:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/43.80/-84.80/100"
+        --lat   43.80 --lon -84.80 --range 100
+        --name  adsb-mi
+        --identity /identities/michigan
+
+  # ── Midwest region ────────────────────────────────────────────────────────────
+
+  # Indiana 75nm: Indianapolis, Fort Wayne, South Bend (overlap), Evansville,
+  # Terre Haute, Columbus IN.
+  sender-indiana:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/39.80/-86.20/75"
+        --lat   39.80 --lon -86.20 --range 75
+        --name  adsb-in
+        --identity /identities/indiana
+
+  # Ohio 80nm: Columbus, Cleveland, Akron, Toledo, Youngstown, Mansfield.
+  sender-ohio:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/40.50/-83.00/80"
+        --lat   40.50 --lon -83.00 --range 80
+        --name  adsb-oh
+        --identity /identities/ohio
+
+  # SW Ohio / N Kentucky 75nm: Cincinnati, Dayton, Lexington, Louisville edge,
+  # Charleston WV edge. Fills the gap below Ohio sender.
+  sender-cincinnati:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/39.10/-84.50/75"
+        --lat   39.10 --lon -84.50 --range 75
+        --name  adsb-cvg
+        --identity /identities/cincinnati
+
+  # Minnesota 80nm: Minneapolis/St. Paul, Rochester, Mankato, St. Cloud.
+  sender-minnesota:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/44.88/-93.22/80"
+        --lat   44.88 --lon -93.22 --range 80
+        --name  adsb-msp
+        --identity /identities/minnesota
+
+  # Iowa 75nm: Des Moines, Cedar Rapids, Iowa City, Waterloo, Dubuque edge.
+  sender-iowa:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/41.60/-93.60/75"
+        --lat   41.60 --lon -93.60 --range 75
+        --name  adsb-ia
+        --identity /identities/iowa
+
+  # Missouri / S Illinois 75nm: St. Louis, Columbia MO, Springfield IL,
+  # Cape Girardeau, Carbondale IL.
+  sender-missouri:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/38.75/-90.37/75"
+        --lat   38.75 --lon -90.37 --range 75
+        --name  adsb-stl
+        --identity /identities/missouri
+
+  # ── Upper Michigan ────────────────────────────────────────────────────────────
+  # UP Michigan 75nm: Marquette, Iron Mountain, Sault Ste Marie, Houghton,
+  # Ironwood, Escanaba. Covers Lake Superior traffic.
+  sender-michigan-up:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/46.50/-87.00/75"
+        --lat   46.50 --lon -87.00 --range 75
+        --name  adsb-up
+        --identity /identities/michigan-up
+
+  # ── Southeast Michigan / Detroit ─────────────────────────────────────────────
+  # SE Michigan 100nm: Detroit, Ann Arbor, Windsor ON, Toledo OH, Lake Erie
+  # western end. Bridges the gap between the Ohio and Lower-Michigan senders
+  # (~213nm apart, beyond their combined 180nm reach).
+
+  sender-detroit:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/42.50/-83.20/100"
+        --lat   42.50 --lon -83.20 --range 100
+        --name  adsb-dtw
+        --identity /identities/detroit
+
+  # ── Northern Lower Michigan / Straits of Mackinac ────────────────────────────
+  # N Michigan 80nm: Traverse City, Petoskey, Cheboygan, Alpena, Mackinac Strait.
+  # Bridges the gap between Lower Michigan and Upper Michigan senders.
+
+  sender-northern-michigan:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/44.80/-84.70/80"
+        --lat   44.80 --lon -84.70 --range 80
+        --name  adsb-ntm
+        --identity /identities/northern-michigan
+
+  # ── Eastern Upper Peninsula / Sault Ste Marie ────────────────────────────────
+  # Eastern UP 80nm: Sault Ste Marie (US/CA), eastern Lake Superior south shore,
+  # Newberry, St. Ignace. Extends UP coverage east (UP sender only reaches ~85.4°W).
+
+  sender-sault:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/46.50/-84.00/80"
+        --lat   46.50 --lon -84.00 --range 80
+        --name  adsb-soo
+        --identity /identities/sault
+
+  # ── Central Lake Superior south shore ────────────────────────────────────────
+  # Central Lake Superior 75nm: Ironwood MI, Ashland WI, Houghton / Keweenaw
+  # Peninsula. Bridges the Duluth↔UP gap along the Lake Superior south shore.
+
+  sender-lake-superior:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/46.60/-89.00/75"
+        --lat   46.60 --lon -89.00 --range 75
+        --name  adsb-sup
+        --identity /identities/lake-superior
+
+  # ── Duluth / Western Lake Superior ───────────────────────────────────────────
+  # Duluth 80nm: Duluth MN, Superior WI, Iron Range, Two Harbors, western Lake
+  # Superior south shore. Fills the gap north of the Minnesota sender (~138nm away).
+
+  sender-duluth:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/46.80/-91.50/80"
+        --lat   46.80 --lon -91.50 --range 80
+        --name  adsb-dlh
+        --identity /identities/duluth
+
+  # ── Pittsburgh / Lake Erie central ───────────────────────────────────────────
+  # Pittsburgh 100nm: Pittsburgh PA, Erie PA, Lake Erie central corridor,
+  # Youngstown OH. Bridges Ohio↔Buffalo and adds all of western Pennsylvania.
+
+  sender-pittsburgh:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/41.50/-80.00/100"
+        --lat   41.50 --lon -80.00 --range 100
+        --name  adsb-pit
+        --identity /identities/pittsburgh
+
+  # ── Buffalo / Western New York ────────────────────────────────────────────────
+  # Buffalo 80nm: Buffalo NY, Niagara Falls, Lake Erie eastern shore,
+  # Lake Ontario western end, Hamilton ON edge.
+
+  sender-buffalo:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/43.00/-78.50/80"
+        --lat   43.00 --lon -78.50 --range 80
+        --name  adsb-buf
+        --identity /identities/buffalo
+
+  # ── Rochester / Lake Ontario ──────────────────────────────────────────────────
+  # Rochester 75nm: Rochester NY, Syracuse NY, Lake Ontario south shore,
+  # Finger Lakes, eastern terminus of the Great Lakes basin.
+
+  sender-rochester:
+    <<: *sender-defaults
+    command: >
+      adsb-sender
+        --url   "https://api.adsb.lol/v2/point/43.15/-76.50/75"
+        --lat   43.15 --lon -76.50 --range 75
+        --name  adsb-roc
+        --identity /identities/rochester
+
+  # ── Interactive receiver ──────────────────────────────────────────────────────
+  # Run:  docker compose run --rm -it receiver
+  #
+  # receiver.conf is persisted in a named volume so known/blocked senders
+  # survive across --rm runs.  The config is stored at /config/receiver.conf
+  # inside the container; mount the volume externally if you want to inspect it:
+  #   docker run --rm -v adsb_lora_receiver-config:/config busybox cat /config/receiver.conf
+  receiver:
+    build: .
+    image: adsb-lora
+    # Change --home-lat / --home-lon to your location and --home-range to your
+    # desired gate radius (nm).  Senders outside home_range + sender_range are
+    # shown as "out of range" until you pan your viewport toward them.
+    command: >
+      adsb-receiver
+        --home-lat   41.88
+        --home-lon   -87.63
+        --home-range 150
+        --config     /config/receiver.conf
+    volumes:
+      - ./docker/node-reticulum.conf:/root/.reticulum/config:ro
+      - receiver-config:/config
+    networks:
+      - adsb-mesh
+    depends_on:
+      - transport
+    stdin_open: true
+    tty: true
+    profiles:
+      - receiver
+
+networks:
+  adsb-mesh:
+    driver: bridge
+
+volumes:
+  sender-identities:
+  transport-rns-storage:
+  receiver-config:      # persists receiver.conf (known/blocked senders) across --rm runs

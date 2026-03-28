@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adsb-radar"
+version = "0.2.0"
+description = "Decentralized live ADS-B radar over Reticulum mesh (LoRa, TCP, WiFi)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "rns>=0.7.0",
+]
+
+[project.urls]
+Repository = "https://github.com/alabbott/adsb-radar"
+
+[project.scripts]
+adsb-sender   = "adsb_radar.sender:main"
+adsb-receiver = "adsb_radar.receiver:main"
+adsb-alerts   = "adsb_radar.alerts:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B"]
+ignore = [
+    "E501",  # line-too-long — formatter handles this; don't double-report
+    "B006",  # mutable-default-arg — some intentional patterns in curses callbacks
+    "B007",  # unused-loop-var — some intentional patterns
+]
+
+[tool.ruff.format]
+quote-style = "double"

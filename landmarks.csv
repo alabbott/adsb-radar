@@ -1,0 +1,35 @@
+# Extra landmarks for adsb_receiver.py  --map landmarks.csv
+# Format: type,char,label,lat,lon
+#
+# type   : "airport", "city", "water", or any label (only "water" rows go to shoreline)
+# char   : display character on radar  (e.g. +  @ ~  ·)
+# label  : short name shown next to the character (leave empty for pure shoreline dots)
+# lat    : decimal degrees N (negative = S)
+# lon    : decimal degrees E (negative = W)
+#
+# Examples — uncomment/edit as needed:
+
+# ── Canadian airports near Great Lakes ───────────────────────────────────────
+#airport,+,YYZ,43.6777,-79.6248
+#airport,+,YOW,45.3225,-75.6692
+#airport,+,YUL,45.4706,-73.7408
+#airport,+,YQT,48.3722,-89.3239
+#airport,+,YXU,43.0356,-81.1531
+
+# ── Michigan UP extra detail ──────────────────────────────────────────────────
+#airport,+,CMX,47.1683,-88.4891
+#airport,+,ESC,45.7227,-87.0936
+
+# ── Pennsylvania / New York border ───────────────────────────────────────────
+#airport,+,PIT,40.4915,-80.2329
+#airport,+,BUF,42.9405,-78.7322
+#airport,+,ROC,43.1189,-77.6724
+
+# ── Lake Michigan extra shoreline points ─────────────────────────────────────
+# (supplement the built-in LAKE_SHORELINE with finer detail)
+#water,~,,43.0000,-86.5000
+#water,~,,43.5000,-87.0000
+
+# ── Custom city markers ───────────────────────────────────────────────────────
+#city,@,Toronto,43.6532,-79.3832
+#city,@,Ottawa,45.4215,-75.6972

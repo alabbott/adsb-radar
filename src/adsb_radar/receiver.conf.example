@@ -1,0 +1,29 @@
+# receiver.conf — receiver.py persistent state
+#
+# This file is written automatically by the receiver.
+# You don't normally need to edit it by hand.
+#
+# To use a different path:  adsb-receiver --config /path/to/receiver.conf
+#
+# ── known_senders ─────────────────────────────────────────────────────────────
+# Senders added here are connected immediately on startup — before any RNS
+# announces arrive.  The receiver writes entries automatically the first time
+# it successfully links to a sender.
+#
+# Format:   <32-char dest hash> = <sender name>
+#
+[known_senders]
+# a1b2c3d4e5f678901234567890abcdef = adsb-chicago
+# 00112233445566778899aabbccddeeff = adsb-milwaukee
+
+# ── blocked_senders ───────────────────────────────────────────────────────────
+# Senders listed here are permanently ignored — their announces are silently
+# dropped and no link is ever formed, even if they appear in the mesh.
+#
+# Press 'b' on a sender in the sources page to toggle block/unblock.
+# The receiver writes and removes entries automatically.
+#
+# Format:   <32-char dest hash> = 1
+#
+[blocked_senders]
+# deadbeefdeadbeefdeadbeefdeadbeef = 1
