@@ -183,11 +183,16 @@ def _set_source_status(src_id, status):
 def _on_link_closed(link, src_id):
     with _sources_lock:
         if src_id in _sources:
+            t0 = _sources[src_id].get("_link_t0")
+            up_for = f"{time.time() - t0:.0f}s" if t0 else "?"
+            last_rx = _sources[src_id].get("last_rx")
+            since_rx = f"{time.time() - last_rx:.0f}s" if last_rx else "never"
+            name = _sources[src_id].get("name", src_id)
             _sources[src_id]["link"] = None
-            # Only set 'disconnected' if the sender is still active —
-            # don't overwrite 'disabled' or 'blocked' (user-controlled states)
+            _sources[src_id]["_link_t0"] = None
             if _sources[src_id].get("enabled", True):
                 _sources[src_id]["status"] = "disconnected"
+    log.info("LINK_DOWN %s  name=%s  up_for=%s  last_frame=%s_ago", src_id, name, up_for, since_rx)
     _frame_queue.put_nowait({"type": "link_closed", "src_id": src_id})
 
 
@@ -204,6 +209,8 @@ def _on_packet(message, packet, src_id):
                 return  # disabled or blocked — ignore in-flight packet from async teardown
             if now - _sources[src_id].get("_last_pkt_t", 0) < _PACKET_MIN_INTERVAL:
                 return  # rate limit: max 10 packets/sec per source
+            prev_rx = _sources[src_id].get("last_rx")
+            gap = now - prev_rx if prev_rx else 0
             _sources[src_id]["_last_pkt_t"] = now
             _sources[src_id]["last_ts"] = frame["ts"]
             _sources[src_id]["last_rx"] = now
@@ -238,6 +245,8 @@ def _on_packet(message, packet, src_id):
                     continue  # DB full; only update existing entries
                 _aircraft_db[icao] = {"ac": ac, "source": src_id, "received": now, "obs_ts": obs_ts}
 
+        if gap > 15:
+            log.warning("FRAME_GAP %s  gap=%.0fs  ac=%d", src_id, gap, len(frame["aircraft"]))
         _frame_queue.put_nowait({"type": "frame", "src_id": src_id})
     except Exception:
         log.debug("Packet decode error from %s", src_id, exc_info=True)
@@ -250,19 +259,31 @@ def connect_to_sender(src_id, timeout=30):
         if not _sources[src_id].get("enabled", True):
             return
         dest_hash = _sources[src_id]["dest_hash"]
+        attempt = _sources[src_id].get("_connect_attempts", 0) + 1
+        _sources[src_id]["_connect_attempts"] = attempt
 
     _set_source_status(src_id, "searching…")
+    t_req = time.time()
     if not RNS.Transport.has_path(dest_hash):
+        log.info("PATH_REQ  %s  attempt=%d  (no cached path, requesting)", src_id, attempt)
         RNS.Transport.request_path(dest_hash)
-        deadline = time.time() + timeout
+        deadline = t_req + timeout
         while not RNS.Transport.has_path(dest_hash):
             if time.time() > deadline:
+                log.warning(
+                    "PATH_FAIL %s  attempt=%d  after=%.0fs  (no path found)",
+                    src_id, attempt, time.time() - t_req,
+                )
                 _set_source_status(src_id, "no path")
                 return
             time.sleep(0.2)
+        log.info("PATH_OK   %s  attempt=%d  after=%.1fs", src_id, attempt, time.time() - t_req)
+    else:
+        log.info("PATH_OK   %s  attempt=%d  (cached)", src_id, attempt)
 
     identity = RNS.Identity.recall(dest_hash)
     if identity is None:
+        log.warning("IDENTITY_UNKNOWN  %s", src_id)
         _set_source_status(src_id, "identity unknown")
         return
 
@@ -287,10 +308,13 @@ def connect_to_sender(src_id, timeout=30):
             else:
                 _sources[src_id]["link"] = link
                 _sources[src_id]["status"] = "linked"
+                _sources[src_id]["_link_t0"] = time.time()
+                _sources[src_id]["_connect_attempts"] = 0  # reset on successful link
                 sender_name = _sources[src_id].get("name", src_id)
         if should_teardown:
             link.teardown()
             return
+        log.info("LINK_UP   %s  name=%s", src_id, sender_name)
         link.set_packet_callback(lambda msg, pkt: _on_packet(msg, pkt, src_id))
         link.set_link_closed_callback(lambda lnk: _on_link_closed(lnk, src_id))
         _add_known_sender(dest_hash.hex(), sender_name)
@@ -367,6 +391,12 @@ class AdsbAnnounceHandler:
             lat, lon, range_nm, name = CENTER_LAT, CENTER_LON, MAX_RANGE, destination_hash.hex()[:8]
         else:
             lat, lon, range_nm, name = info
+        dest_hex = destination_hash.hex()
+        dist_nm = get_dist(lat, lon, _home_lat, _home_lon)
+        log.info(
+            "ANNOUNCE_RX  %-12s %s  lat=%.3f lon=%.3f range=%dnm dist=%.0fnm",
+            name, dest_hex[:8], lat, lon, int(range_nm), dist_nm,
+        )
         _maybe_connect(destination_hash, lat, lon, range_nm, name)
 
 

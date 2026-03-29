@@ -72,6 +72,10 @@ _dest = None
 _app_data = None
 _last_announce = [0.0]  # [timestamp] — single-element list for mutability from callback
 
+# ── Per-link establishment timestamps (for link-duration logging) ─────────────
+_link_times = {}  # id(link) → established_time
+_link_times_lock = threading.Lock()
+
 
 # ── RNS callbacks ─────────────────────────────────────────────────────────────
 
@@ -81,7 +85,9 @@ def on_link_established(link):
     link.set_packet_callback(on_view_request)  # listen for pan/zoom requests
     with _links_lock:
         _active_links[id(link)] = link
-    log.info("Link UP   %s…  (%d total)", link.hash.hex()[:8], _link_count())
+    with _link_times_lock:
+        _link_times[id(link)] = time.time()
+    log.info("LINK_UP   hash=%s  peers=%d", link.hash.hex()[:8], _link_count())
 
 
 def on_link_closed(link):
@@ -91,14 +97,17 @@ def on_link_closed(link):
         _link_views.pop(id(link), None)
     with _link_view_times_lock:
         _link_view_times.pop(id(link), None)
-    log.info("Link DOWN %s…  (%d total)", link.hash.hex()[:8], _link_count())
+    with _link_times_lock:
+        t0 = _link_times.pop(id(link), None)
+    up_for = f"{time.time() - t0:.0f}s" if t0 else "?"
+    log.info("LINK_DOWN hash=%s  up_for=%s  peers=%d", link.hash.hex()[:8], up_for, _link_count())
     # Re-announce immediately so receivers can find a fresh path when
     # reconnecting.  Without this, the path can sit stale on the network for up
     # to ANNOUNCE_INTERVAL_LINKED (300 s), causing "no path" on reconnect.
     if _dest is not None:
         _dest.announce(app_data=_app_data)
         _last_announce[0] = time.time()
-        log.info("Re-announced after link down.")
+        log.info("ANNOUNCE  trigger=link_close")
 
 
 def on_view_request(message, packet):
@@ -319,7 +328,7 @@ def main():
     _app_data = app_data
 
     dest.announce(app_data=app_data)
-    log.info("Initial announce sent.")
+    log.info("ANNOUNCE  trigger=startup  hash=%s", dest.hexhash[:8])
     log.info("Broadcasting every %ss — waiting for receivers …", args.interval)
 
     _last_announce[0] = time.time()
@@ -361,7 +370,7 @@ def main():
         if time.time() - _last_announce[0] >= announce_interval:
             dest.announce(app_data=app_data)
             _last_announce[0] = time.time()
-            log.info("Re-announced destination.")
+            log.info("ANNOUNCE  trigger=periodic  peers=%d", _link_count())
 
         # Sleep remainder of interval
         elapsed = time.time() - loop_start
