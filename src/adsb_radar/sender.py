@@ -43,7 +43,7 @@ DEFAULT_INTERVAL = 5  # seconds between frames
 DEFAULT_IDENTITY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sender_identity")
 DEFAULT_URL = "http://localhost:8080/data/aircraft.json"
 ANNOUNCE_INTERVAL_IDLE = 60  # re-announce every 60 s when no receivers linked
-ANNOUNCE_INTERVAL_LINKED = 300  # back off to 5 min once at least one link is active
+ANNOUNCE_INTERVAL_LINKED = 60  # re-announce every 60s even when linked (was 300s)
 FETCH_MAX_BACKOFF = 60  # cap exponential backoff at 60 s on repeated fetch errors
 _FETCH_MAX_BYTES = 4 * 1024 * 1024  # 4 MB safety cap on fetch response
 
@@ -298,9 +298,14 @@ def main():
 
     # Connect to running rnsd shared instance
     log.info("Connecting to Reticulum …")
-    RNS.Reticulum()
+    r = RNS.Reticulum()
     # Suppress RNS internal transport/routing chatter; we have our own logging
     RNS.loglevel = RNS.LOG_WARNING
+    try:
+        iface_names = [str(i) for i in r.transport.interfaces]
+        log.info("RNS interfaces: %s", ", ".join(iface_names) if iface_names else "(none — embedded transport)")
+    except Exception:
+        log.debug("Could not enumerate RNS interfaces", exc_info=True)
 
     identity = load_or_create_identity(args.identity)
 

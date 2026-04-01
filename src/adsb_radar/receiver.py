@@ -39,10 +39,12 @@ Keys:
 import argparse
 import configparser
 import curses
+import json
 import logging
 import math
 import os
 import queue
+import random
 import sys
 import threading
 import time
@@ -74,12 +76,35 @@ log = logging.getLogger(__name__)
 _console_handler: logging.Handler = logging.NullHandler()  # replaced by setup_logging()
 
 
-def setup_logging(level: int = logging.INFO, log_file: str = None) -> None:
+class JsonFormatter(logging.Formatter):
+    """Machine-readable JSON log formatter for --log-json mode."""
+
+    def format(self, record):
+        import re
+        msg = record.getMessage()
+        fields = {m.group(1): m.group(2) for m in re.finditer(r"(\w+)=([\w.:\-?/]+)", msg)}
+        entry = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": msg,
+        }
+        if fields:
+            entry["fields"] = fields
+        if record.exc_info:
+            entry["exc"] = self.formatException(record.exc_info)
+        return json.dumps(entry)
+
+
+def setup_logging(level: int = logging.INFO, log_file: str = None, json_mode: bool = False) -> None:
     """Configure root logger.  Called once from main() before curses starts."""
     global _console_handler
     root = logging.getLogger()
     root.setLevel(level)
-    fmt = logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    if json_mode:
+        fmt = JsonFormatter()
+    else:
+        fmt = logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
     _console_handler = logging.StreamHandler()
     _console_handler.setFormatter(fmt)
     root.addHandler(_console_handler)
@@ -109,6 +134,27 @@ _frame_queue = queue.SimpleQueue()
 #                               enabled, dist_nm}
 _sources = {}
 _sources_lock = threading.Lock()
+
+# ── Per-source connection locking (prevents duplicate concurrent connects) ────
+_connect_locks: dict = {}
+_connect_locks_lock = threading.Lock()
+
+
+def _get_connect_lock(src_id: str) -> threading.Lock:
+    with _connect_locks_lock:
+        if src_id not in _connect_locks:
+            _connect_locks[src_id] = threading.Lock()
+        return _connect_locks[src_id]
+
+
+def _connect_backoff(attempts: int) -> float:
+    """Exponential backoff: 5s → 10s → 20s → 40s → 80s → 160s → 300s (cap)."""
+    return min(300.0, 5.0 * (2.0**attempts))
+
+
+# ── PATH_REQ rate tracking (logged every 60s by _path_rate_logger) ───────────
+_path_stats: dict = {"sent": 0, "resolved": 0, "failed": 0, "unique": set()}
+_path_stats_lock = threading.Lock()
 
 # ── Home position for geographic source gating ────────────────────────────────
 # Set from --home-lat / --home-lon / --home-range in main()
@@ -253,111 +299,154 @@ def _on_packet(message, packet, src_id):
 
 
 def connect_to_sender(src_id, timeout=30):
-    with _sources_lock:
-        if src_id not in _sources:
-            return
-        if not _sources[src_id].get("enabled", True):
-            return
-        dest_hash = _sources[src_id]["dest_hash"]
-        attempt = _sources[src_id].get("_connect_attempts", 0) + 1
-        _sources[src_id]["_connect_attempts"] = attempt
-
-    _set_source_status(src_id, "searching…")
-    t_req = time.time()
-    if not RNS.Transport.has_path(dest_hash):
-        log.info("PATH_REQ  %s  attempt=%d  (no cached path, requesting)", src_id, attempt)
-        RNS.Transport.request_path(dest_hash)
-        deadline = t_req + timeout
-        while not RNS.Transport.has_path(dest_hash):
-            if time.time() > deadline:
-                log.warning(
-                    "PATH_FAIL %s  attempt=%d  after=%.0fs  (no path found)",
-                    src_id, attempt, time.time() - t_req,
-                )
-                _set_source_status(src_id, "no path")
-                return
-            time.sleep(0.2)
-        log.info("PATH_OK   %s  attempt=%d  after=%.1fs", src_id, attempt, time.time() - t_req)
-    else:
-        log.info("PATH_OK   %s  attempt=%d  (cached)", src_id, attempt)
-
-    identity = RNS.Identity.recall(dest_hash)
-    if identity is None:
-        log.warning("IDENTITY_UNKNOWN  %s", src_id)
-        _set_source_status(src_id, "identity unknown")
+    lock = _get_connect_lock(src_id)
+    if not lock.acquire(blocking=False):
+        log.debug("CONNECT_SKIP  %s  reason=already_in_progress", src_id)
         return
-
-    # Second enabled check — user may have pressed Space while we were searching
-    with _sources_lock:
-        if not _sources.get(src_id, {}).get("enabled", True):
-            return
-
-    destination = RNS.Destination(
-        identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "adsb", "radar"
-    )
-    _set_source_status(src_id, "linking…")
-
-    def _on_established(link):
-        # Guard: sender may have been disabled/blocked while we were connecting.
-        # Tear down outside the lock to avoid deadlock with _on_link_closed.
-        should_teardown = False
-        sender_name = src_id
-        with _sources_lock:
-            if src_id not in _sources or not _sources[src_id].get("enabled", True):
-                should_teardown = True
-            else:
-                _sources[src_id]["link"] = link
-                _sources[src_id]["status"] = "linked"
-                _sources[src_id]["_link_t0"] = time.time()
-                _sources[src_id]["_connect_attempts"] = 0  # reset on successful link
-                sender_name = _sources[src_id].get("name", src_id)
-        if should_teardown:
-            link.teardown()
-            return
-        log.info("LINK_UP   %s  name=%s", src_id, sender_name)
-        link.set_packet_callback(lambda msg, pkt: _on_packet(msg, pkt, src_id))
-        link.set_link_closed_callback(lambda lnk: _on_link_closed(lnk, src_id))
-        _add_known_sender(dest_hash.hex(), sender_name)
-        _frame_queue.put_nowait({"type": "link_up", "src_id": src_id})
-
     try:
-        RNS.Link(
-            destination,
-            established_callback=_on_established,
-            closed_callback=lambda lnk: _on_link_closed(lnk, src_id),
+        with _sources_lock:
+            if src_id not in _sources:
+                return
+            if not _sources[src_id].get("enabled", True):
+                return
+            dest_hash = _sources[src_id]["dest_hash"]
+            attempt = _sources[src_id].get("_connect_attempts", 0) + 1
+            _sources[src_id]["_connect_attempts"] = attempt
+
+        _set_source_status(src_id, "searching…")
+        t_req = time.time()
+        if not RNS.Transport.has_path(dest_hash):
+            # PATH_REQ gating — only flood the mesh if we've heard an announce recently
+            with _sources_lock:
+                last_ann = _sources.get(src_id, {}).get("last_announce_at")
+            if last_ann is None or (time.time() - last_ann) > 360:
+                ago = f"{time.time() - last_ann:.0f}s_ago" if last_ann else "never"
+                log.info(
+                    "PATH_WAIT  %s  last_announce=%s  (no PATH_REQ, waiting for announce)",
+                    src_id, ago,
+                )
+                _set_source_status(src_id, "waiting for announce")
+                return
+            log.info("PATH_REQ  %s  attempt=%d  (no cached path, requesting)", src_id, attempt)
+            with _path_stats_lock:
+                _path_stats["sent"] += 1
+                _path_stats["unique"].add(src_id)
+            RNS.Transport.request_path(dest_hash)
+            deadline = t_req + timeout
+            while not RNS.Transport.has_path(dest_hash):
+                if time.time() > deadline:
+                    with _path_stats_lock:
+                        _path_stats["failed"] += 1
+                    log.warning(
+                        "PATH_FAIL %s  attempt=%d  after=%.0fs  (no path found)",
+                        src_id, attempt, time.time() - t_req,
+                    )
+                    _set_source_status(src_id, "no path")
+                    return
+                time.sleep(0.2)
+            with _path_stats_lock:
+                _path_stats["resolved"] += 1
+            log.info("PATH_OK   %s  attempt=%d  after=%.1fs", src_id, attempt, time.time() - t_req)
+        else:
+            log.info("PATH_OK   %s  attempt=%d  (cached)", src_id, attempt)
+
+        identity = RNS.Identity.recall(dest_hash)
+        if identity is None:
+            log.warning("IDENTITY_UNKNOWN  %s", src_id)
+            _set_source_status(src_id, "identity unknown")
+            return
+
+        # Second enabled check — user may have pressed Space while we were searching
+        with _sources_lock:
+            if not _sources.get(src_id, {}).get("enabled", True):
+                return
+
+        destination = RNS.Destination(
+            identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "adsb", "radar"
         )
-    except Exception as e:
-        log.error("Failed to create link to %s: %s", src_id, e, exc_info=True)
-        _set_source_status(src_id, "error")
+        _set_source_status(src_id, "linking…")
+
+        def _on_established(link):
+            # Guard: sender may have been disabled/blocked while we were connecting.
+            # Tear down outside the lock to avoid deadlock with _on_link_closed.
+            should_teardown = False
+            sender_name = src_id
+            with _sources_lock:
+                if src_id not in _sources or not _sources[src_id].get("enabled", True):
+                    should_teardown = True
+                else:
+                    _sources[src_id]["link"] = link
+                    _sources[src_id]["status"] = "linked"
+                    _sources[src_id]["_link_t0"] = time.time()
+                    _sources[src_id]["_connect_attempts"] = 0  # reset on successful link
+                    sender_name = _sources[src_id].get("name", src_id)
+            if should_teardown:
+                link.teardown()
+                return
+            log.info("LINK_UP   %s  name=%s", src_id, sender_name)
+            link.set_packet_callback(lambda msg, pkt: _on_packet(msg, pkt, src_id))
+            link.set_link_closed_callback(lambda lnk: _on_link_closed(lnk, src_id))
+            _add_known_sender(dest_hash.hex(), sender_name)
+            _frame_queue.put_nowait({"type": "link_up", "src_id": src_id})
+
+        try:
+            RNS.Link(
+                destination,
+                established_callback=_on_established,
+                closed_callback=lambda lnk: _on_link_closed(lnk, src_id),
+            )
+        except Exception as e:
+            log.error("Failed to create link to %s: %s", src_id, e, exc_info=True)
+            _set_source_status(src_id, "error")
+    finally:
+        lock.release()
 
 
 def _maybe_connect(dest_hash_bytes, lat, lon, range_nm, name):
     """Called when an announce is received; connect to new senders automatically."""
     dest_hex = dest_hash_bytes.hex()
     if dest_hex in _blocked_senders:
+        log.debug("ANNOUNCE_SKIP  %s  reason=blocked", dest_hex[:8])
         return
     src_id = dest_hex[:8]
     dist_nm = get_dist(lat, lon, _home_lat, _home_lon)
     enabled = dist_nm <= _home_range_nm + range_nm
 
+    old_timer = None
     with _sources_lock:
         if src_id in _sources:
             # Update metadata from announce even if already connected
             _sources[src_id].update(
                 center=(lat, lon), range_nm=range_nm, name=name, dist_nm=dist_nm
             )
+            # Track announce time and cancel any pending reconnect timer — path is hot now
+            _sources[src_id]["last_announce_at"] = time.time()
+            old_timer = _sources[src_id].get("_reconnect_timer")
+            if old_timer is not None:
+                _sources[src_id]["_reconnect_timer"] = None
+
             st = _sources[src_id]["status"]
-            if st in ("linked", "linking…", "searching…", "reconnecting…", "disabled", "blocked"):
+            if st in ("disabled", "blocked"):
+                log.debug("ANNOUNCE_SKIP  %s  reason=%s", src_id, st)
                 return  # user-controlled states — never auto-reconnect
+            if st in ("linked", "linking…", "searching…", "reconnecting…"):
+                log.debug("ANNOUNCE_SKIP  %s  reason=%s", src_id, st.replace("…", "_in_progress"))
+                # Still cancel the timer — connection is already underway
+                if old_timer is not None:
+                    old_timer.cancel()
+                return
             # Re-enable if a previously out-of-range sender moved into range
             if st == "out of range" and enabled:
                 _sources[src_id]["enabled"] = True
                 _sources[src_id]["status"] = "pending"
             elif not enabled:
+                log.info("ANNOUNCE_SKIP  %s  reason=out_of_range  dist=%.0fnm", src_id, dist_nm)
                 return  # still gated
         else:
             if len(_sources) >= MAX_SOURCES:
-                log.warning("Source limit reached (%d); ignoring %s", MAX_SOURCES, src_id)
+                log.warning(
+                    "ANNOUNCE_SKIP  %s  reason=source_limit  limit=%d", src_id, MAX_SOURCES
+                )
                 return
             _sources[src_id] = {
                 "dest_hash": dest_hash_bytes,
@@ -373,7 +462,15 @@ def _maybe_connect(dest_hash_bytes, lat, lon, range_nm, name):
                 "dist_nm": dist_nm,
                 "bytes_rx": 0,
                 "bw_samples": [],
+                "last_announce_at": time.time(),
+                "_reconnect_timer": None,
             }
+
+    # Cancel pending timer outside the lock to avoid blocking RNS callback thread
+    if old_timer is not None:
+        old_timer.cancel()
+        log.debug("RECONNECT_CANCEL  %s  (announce arrived, connecting immediately)", src_id)
+
     _frame_queue.put_nowait({"type": "new_source", "src_id": src_id})
     if enabled:
         threading.Thread(target=connect_to_sender, args=(src_id,), daemon=True).start()
@@ -1316,15 +1413,31 @@ def _curses_main(stdscr):
             needs_redraw = True
             if isinstance(item, dict) and item.get("type") == "link_closed":
                 src_id = item["src_id"]
+                with _sources_lock:
+                    attempts = _sources.get(src_id, {}).get("_connect_attempts", 0)
+                    old_timer = _sources.get(src_id, {}).get("_reconnect_timer")
+                if old_timer is not None:
+                    old_timer.cancel()
+                delay = _connect_backoff(attempts) + random.uniform(0, 5.0)
+                log.debug(
+                    "RECONNECT_WAIT  %s  delay=%.0fs  attempt=%d",
+                    src_id, delay, attempts + 1,
+                )
 
-                def _rc(sid=src_id):
-                    time.sleep(5)
+                def _do_reconnect(sid=src_id):
                     with _sources_lock:
                         if not _sources.get(sid, {}).get("enabled", True):
                             return
+                        if sid in _sources:
+                            _sources[sid]["_reconnect_timer"] = None
                     connect_to_sender(sid)
 
-                threading.Thread(target=_rc, daemon=True).start()
+                t = threading.Timer(delay, _do_reconnect)
+                t.daemon = True
+                t.start()
+                with _sources_lock:
+                    if src_id in _sources:
+                        _sources[src_id]["_reconnect_timer"] = t
             elif isinstance(item, dict) and item.get("type") == "link_up":
                 # Push current viewport to the newly linked sender immediately
                 # so it filters its frames to our window from the first packet.
@@ -1545,6 +1658,40 @@ def _curses_main(stdscr):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
+def _warn_stale_config_hashes():
+    """Log a warning for any known sender hashes with no cached RNS identity."""
+    with _config_lock:
+        known = dict(_known_senders)
+    stale = [
+        (h, n) for h, n in known.items() if RNS.Identity.recall(bytes.fromhex(h)) is None
+    ]
+    if stale:
+        log.warning(
+            "STALE_CONFIG  %d/%d known sender hashes have no cached identity "
+            "(clear receiver config volume if senders were rebuilt): %s",
+            len(stale),
+            len(known),
+            ", ".join(f"{h[:8]}({n})" for h, n in stale),
+        )
+    else:
+        log.info("CONFIG_OK  %d known sender hashes all have cached identities", len(known))
+
+
+def _path_rate_logger():
+    """Daemon thread: log PATH_REQ rate summary every 60 seconds."""
+    while True:
+        time.sleep(60)
+        with _path_stats_lock:
+            s = _path_stats["sent"]
+            r = _path_stats["resolved"]
+            f = _path_stats["failed"]
+            u = len(_path_stats["unique"])
+            _path_stats.update(sent=0, resolved=0, failed=0, unique=set())
+        log.info(
+            "PATH_RATE  sent=%d  resolved=%d  failed=%d  unique=%d  (last 60s)", s, r, f, u
+        )
+
+
 def _register_sender(dest_hex, name=None, status="pending"):
     """Add a sender to _sources without starting a connection thread."""
     dest_hash = bytes.fromhex(dest_hex)
@@ -1565,6 +1712,8 @@ def _register_sender(dest_hex, name=None, status="pending"):
                 "dist_nm": None,
                 "bytes_rx": 0,
                 "bw_samples": [],
+                "last_announce_at": None,
+                "_reconnect_timer": None,
             }
     return src_id
 
@@ -1645,10 +1794,16 @@ def main():
         metavar="PATH",
         help="Append log output to this file (default: stderr only before curses)",
     )
+    ap.add_argument(
+        "--log-json",
+        action="store_true",
+        default=False,
+        help="Emit log output as JSON (one object per line)",
+    )
     args = ap.parse_args()
 
     numeric_level = getattr(logging, args.log_level.upper(), logging.INFO)
-    setup_logging(level=numeric_level, log_file=args.log_file)
+    setup_logging(level=numeric_level, log_file=args.log_file, json_mode=args.log_json)
 
     # Load config (known/blocked senders)
     load_config(args.config)
@@ -1690,19 +1845,32 @@ def main():
     log.info("Connecting to Reticulum …")
     RNS.Reticulum()
 
+    log.info(
+        "RECEIVER_START  pid=%d  config=%s  home=(%.3f,%.3f)  range=%dnm  known=%d",
+        os.getpid(),
+        _config_path,
+        _home_lat,
+        _home_lon,
+        int(_home_range_nm),
+        len(_known_senders),
+    )
+    _warn_stale_config_hashes()
+
+    # Start PATH_REQ rate summary logger
+    threading.Thread(target=_path_rate_logger, daemon=True).start()
+
     # Register announce handler for auto-discovery of senders on the mesh
     RNS.Transport.register_announce_handler(AdsbAnnounceHandler())
 
-    # Connect to any explicitly specified senders
+    # Explicit --dest senders: register now, wait in the 30s announce window
     for dest_hex in dest_hexes:
         if dest_hex in _blocked_senders:
-            log.info("Skipping %s… [blocked]", dest_hex[:8])
+            log.info("Skipping %s [blocked]", dest_hex[:8])
             continue
-        src_id = _register_sender(dest_hex)
-        log.info("Connecting to %s… [explicit]", dest_hex[:8])
-        threading.Thread(target=connect_to_sender, args=(src_id,), daemon=True).start()
+        _register_sender(dest_hex, status="waiting for announce")
+        log.info("STARTUP_WAIT  %s  [explicit, waiting up to 30s for announce]", dest_hex[:8])
 
-    # Auto-connect to known senders from config (not blocked, not already queued)
+    # Known senders from config: register, wait in the 30s announce window
     with _config_lock:
         known_copy = dict(_known_senders)
         blocked_copy = set(_blocked_senders)
@@ -1711,10 +1879,31 @@ def main():
             continue
         src_id = dest_hex[:8]
         if src_id in _sources:
-            continue  # already queued via --dest
-        _register_sender(dest_hex, name)
-        log.info("Connecting to %s (%s) [known]", dest_hex[:8], name)
-        threading.Thread(target=connect_to_sender, args=(src_id,), daemon=True).start()
+            continue  # already registered via --dest
+        _register_sender(dest_hex, name, status="waiting for announce")
+        log.info("STARTUP_WAIT  %s (%s)  [known, waiting up to 30s for announce]", dest_hex[:8], name)
+
+    def _startup_connect_silent(known=known_copy, blocked=blocked_copy, explicit=list(dest_hexes)):
+        """After 30s, connect to any sender that didn't announce (staggered 1s apart)."""
+        time.sleep(30)
+        silent = []
+        with _sources_lock:
+            for dest_hex in list(known.keys()) + explicit:
+                if dest_hex in blocked:
+                    continue
+                sid = dest_hex[:8]
+                s = _sources.get(sid, {})
+                if s.get("last_announce_at") is None and s.get("enabled", True):
+                    silent.append(sid)
+        if silent:
+            log.info(
+                "STARTUP_FALLBACK  %d silent senders connecting via PATH_REQ (staggered 1s)",
+                len(silent),
+            )
+        for i, sid in enumerate(silent):
+            threading.Timer(i * 1.0, connect_to_sender, args=(sid,)).start()
+
+    threading.Thread(target=_startup_connect_silent, daemon=True).start()
 
     # Register blocked senders in _sources so they appear in the sources page
     # and can be unblocked with 'b' — don't connect, just show them.
