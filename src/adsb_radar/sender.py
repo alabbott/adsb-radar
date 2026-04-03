@@ -33,6 +33,7 @@ from adsb_radar.proto import (
     CENTER_LAT,
     CENTER_LON,
     MAX_RANGE,
+    decode_frame,
     decode_view_request,
     encode_announce_data,
     encode_frame,
@@ -124,17 +125,22 @@ def on_view_request(message, packet):
     now = time.time()
     with _link_view_times_lock:
         if now - _link_view_times.get(id(link), 0) < VIEW_REQ_MIN_INTERVAL:
+            log.debug("VIEW_REQ_DROPPED  hash=%s  reason=rate_limited", link.hash.hex()[:8])
             return
         _link_view_times[id(link)] = now
 
     data = bytes(message)
     result = decode_view_request(data)
     if result is None:
+        log.debug("VIEW_REQ_DROPPED  hash=%s  reason=decode_error  len=%d", link.hash.hex()[:8], len(data))
         return
     c_lat, c_lon, r_nm = result
     with _link_views_lock:
         _link_views[id(link)] = (c_lat, c_lon, r_nm)
-    log.debug("View↗ %s: ctr=(%.3f,%.3f) r=%dnm", link.hash.hex()[:8], c_lat, c_lon, r_nm)
+    log.info(
+        "VIEW_REQ  hash=%s  lat=%.3f  lon=%.3f  range=%.0fnm",
+        link.hash.hex()[:8], c_lat, c_lon, r_nm,
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -179,6 +185,7 @@ def broadcast_frame(aircraft_list, sender_lat, sender_lon, sender_range):
     with _links_lock:
         snapshot = list(_active_links.values())
     sent = 0
+    total_ac = len(aircraft_list)
     for link in snapshot:
         if link.status != RNS.Link.ACTIVE:
             continue
@@ -186,13 +193,23 @@ def broadcast_frame(aircraft_list, sender_lat, sender_lon, sender_range):
             view = _link_views.get(id(link))
         if view is not None:
             c_lat, c_lon, r_nm = view
+            viewport_source = "receiver"
         else:
             c_lat, c_lon, r_nm = sender_lat, sender_lon, sender_range
+            viewport_source = "default"
         try:
             frame = encode_frame(aircraft_list, center_lat=c_lat, center_lon=c_lon, range_nm=r_nm)
             pkt = RNS.Packet(link, frame)
             pkt.send()
             sent += 1
+            # Count filtered AC by decoding the frame we just sent
+            filtered_ac = len(decode_frame(frame).get("aircraft", []))
+            log.debug(
+                "FRAME_SENT  hash=%s  ac=%d/%d  bytes=%d  view=%s"
+                "  lat=%.3f  lon=%.3f  range=%.0fnm",
+                link.hash.hex()[:8], filtered_ac, total_ac, len(frame),
+                viewport_source, c_lat, c_lon, r_nm,
+            )
         except Exception as e:
             log.warning("Send error on %s: %s", link.hash.hex()[:8], e)
     return sent
@@ -327,6 +344,10 @@ def main():
     log.info("URL              : %s", args.url)
     log.info("Center           : (%s, %s)  range: %snm", sender_lat, sender_lon, sender_range)
     log.info("Name             : %s", args.name)
+    log.info(
+        "SENDER_START  hash=%s  name=%s  lat=%.3f  lon=%.3f  range=%.0fnm  url=%s",
+        dest.hexhash[:8], args.name, sender_lat, sender_lon, sender_range, args.url,
+    )
 
     global _dest, _app_data
     _dest = dest

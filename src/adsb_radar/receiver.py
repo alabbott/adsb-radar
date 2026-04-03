@@ -271,6 +271,7 @@ def _on_packet(message, packet, src_id):
             if not _sources[src_id].get("enabled", True):
                 return  # disabled or blocked — ignore in-flight packet from async teardown
             if now - _sources[src_id].get("_last_pkt_t", 0) < _PACKET_MIN_INTERVAL:
+                log.debug("PACKET_DROP  %s  reason=rate_limited  bytes=%d", src_id, nb)
                 return  # rate limit: max 10 packets/sec per source
             prev_rx = _sources[src_id].get("last_rx")
             gap = now - prev_rx if prev_rx else 0
@@ -309,6 +310,7 @@ def _on_packet(message, packet, src_id):
                 _aircraft_db[icao] = {"ac": ac, "source": src_id, "received": now, "obs_ts": obs_ts}
 
         ac_n = len(frame["aircraft"])
+        log.debug("FRAME_RX  %s  ac=%d  bytes=%d  gap=%.0fs", src_id, ac_n, nb, gap)
         if gap > 15:
             if ac_n > 0:
                 log.warning("FRAME_GAP %s  gap=%.0fs  ac=%d", src_id, gap, ac_n)
@@ -547,7 +549,7 @@ def _send_view_request(center_lat, center_lon, range_nm):
         except Exception:
             pass
     if sent_to:
-        log.debug(
+        log.info(
             "VIEW_REQ  lat=%.3f  lon=%.3f  range=%.0fnm  recipients=%d  senders=%s",
             center_lat, center_lon, range_nm, len(sent_to), ",".join(sent_to),
         )
