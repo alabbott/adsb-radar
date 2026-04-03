@@ -49,4 +49,4 @@ else
 EOF
 fi
 
-exec "$@"
+exec "$@" ${LOG_LEVEL:+--log-level "$LOG_LEVEL"}

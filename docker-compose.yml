@@ -70,6 +70,7 @@ x-sender-defaults: &sender-defaults
   environment:
     RETICULUM_HOST: "${RETICULUM_HOST:-}"
     RETICULUM_PORT: "${RETICULUM_PORT:-4242}"
+    LOG_LEVEL: "${LOG_LEVEL:-DEBUG}"
   networks:
     - adsb-mesh
   depends_on:
