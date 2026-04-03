@@ -228,17 +228,34 @@ def _set_source_status(src_id, status):
 
 def _on_link_closed(link, src_id):
     with _sources_lock:
-        if src_id in _sources:
-            t0 = _sources[src_id].get("_link_t0")
-            up_for = f"{time.time() - t0:.0f}s" if t0 else "?"
-            last_rx = _sources[src_id].get("last_rx")
-            since_rx = f"{time.time() - last_rx:.0f}s" if last_rx else "never"
-            name = _sources[src_id].get("name", src_id)
-            _sources[src_id]["link"] = None
-            _sources[src_id]["_link_t0"] = None
-            if _sources[src_id].get("enabled", True):
-                _sources[src_id]["status"] = "disconnected"
+        if src_id not in _sources:
+            return
+        # Guard: ignore close callbacks for duplicate/orphaned links.
+        # _on_established tears down raced duplicates; their close callback must
+        # not overwrite the active link reference or trigger a spurious reconnect.
+        if _sources[src_id].get("link") is not link and _sources[src_id].get("link") is not None:
+            log.debug("LINK_CLOSED_ORPHAN  %s  (not active link, ignoring)", src_id)
+            return
+        now = time.time()
+        t0 = _sources[src_id].get("_link_t0")
+        up_s = (now - t0) if t0 else 0.0
+        up_for = f"{up_s:.0f}s" if t0 else "?"
+        last_rx = _sources[src_id].get("last_rx")
+        since_rx = f"{now - last_rx:.0f}s" if last_rx else "never"
+        name = _sources[src_id].get("name", src_id)
+        _sources[src_id]["link"] = None
+        _sources[src_id]["_link_t0"] = None
+        _sources[src_id]["_link_down_count"] = _sources[src_id].get("_link_down_count", 0) + 1
+        _sources[src_id]["_total_up_s"] = _sources[src_id].get("_total_up_s", 0.0) + up_s
+        if _sources[src_id].get("enabled", True):
+            _sources[src_id]["status"] = "disconnected"
+        unstable = t0 is not None and up_s < 30.0
     log.info("LINK_DOWN %s  name=%s  up_for=%s  last_frame=%s_ago", src_id, name, up_for, since_rx)
+    if unstable:
+        log.warning(
+            "LINK_UNSTABLE  %s  name=%s  up_for=%s  (very short — possible remote crash or loop)",
+            src_id, name, up_for,
+        )
     _frame_queue.put_nowait({"type": "link_closed", "src_id": src_id})
 
 
@@ -291,8 +308,12 @@ def _on_packet(message, packet, src_id):
                     continue  # DB full; only update existing entries
                 _aircraft_db[icao] = {"ac": ac, "source": src_id, "received": now, "obs_ts": obs_ts}
 
+        ac_n = len(frame["aircraft"])
         if gap > 15:
-            log.warning("FRAME_GAP %s  gap=%.0fs  ac=%d", src_id, gap, len(frame["aircraft"]))
+            if ac_n > 0:
+                log.warning("FRAME_GAP %s  gap=%.0fs  ac=%d", src_id, gap, ac_n)
+            else:
+                log.debug("FRAME_EMPTY %s  gap=%.0fs  (sender has no aircraft in view)", src_id, gap)
         _frame_queue.put_nowait({"type": "frame", "src_id": src_id})
     except Exception:
         log.debug("Packet decode error from %s", src_id, exc_info=True)
@@ -368,17 +389,26 @@ def connect_to_sender(src_id, timeout=30):
 
         def _on_established(link):
             # Guard: sender may have been disabled/blocked while we were connecting.
+            # Also guard against duplicate links: the connect lock is released before
+            # _on_established fires, so two callers can both reach RNS.Link().  The
+            # second one to establish finds a live link already stored and tears itself
+            # down to avoid orphaned links that each later trigger their own reconnect.
             # Tear down outside the lock to avoid deadlock with _on_link_closed.
             should_teardown = False
             sender_name = src_id
             with _sources_lock:
                 if src_id not in _sources or not _sources[src_id].get("enabled", True):
                     should_teardown = True
+                elif _sources[src_id].get("link") is not None:
+                    # Another connection won the race — drop this duplicate.
+                    log.debug("LINK_DUP_TEARDOWN  %s  (active link already established)", src_id)
+                    should_teardown = True
                 else:
                     _sources[src_id]["link"] = link
                     _sources[src_id]["status"] = "linked"
                     _sources[src_id]["_link_t0"] = time.time()
                     _sources[src_id]["_connect_attempts"] = 0  # reset on successful link
+                    _sources[src_id]["_link_up_count"] = _sources[src_id].get("_link_up_count", 0) + 1
                     sender_name = _sources[src_id].get("name", src_id)
             if should_teardown:
                 link.teardown()
@@ -464,6 +494,9 @@ def _maybe_connect(dest_hash_bytes, lat, lon, range_nm, name):
                 "bw_samples": [],
                 "last_announce_at": time.time(),
                 "_reconnect_timer": None,
+                "_link_up_count": 0,
+                "_link_down_count": 0,
+                "_total_up_s": 0.0,
             }
 
     # Cancel pending timer outside the lock to avoid blocking RNS callback thread
@@ -500,16 +533,24 @@ class AdsbAnnounceHandler:
 def _send_view_request(center_lat, center_lon, range_nm):
     """Send a view-request to ALL active sender links."""
     with _sources_lock:
-        links = [s["link"] for s in _sources.values() if s.get("link") is not None]
-    if not links:
+        active = [(s["link"], s.get("name", "?")) for s in _sources.values()
+                  if s.get("link") is not None]
+    if not active:
         return
     data = encode_view_request(center_lat, center_lon, range_nm)
-    for link in links:
+    sent_to = []
+    for link, name in active:
         try:
             if link.status == RNS.Link.ACTIVE:
                 RNS.Packet(link, data).send()
+                sent_to.append(name)
         except Exception:
             pass
+    if sent_to:
+        log.debug(
+            "VIEW_REQ  lat=%.3f  lon=%.3f  range=%.0fnm  recipients=%d  senders=%s",
+            center_lat, center_lon, range_nm, len(sent_to), ",".join(sent_to),
+        )
 
 
 def _check_view_enables(view_lat, view_lon, view_range_nm):
@@ -1395,6 +1436,7 @@ def _curses_main(stdscr):
     _view_req_pending = False
     _view_req_args = None  # (center_lat, center_lon, range_nm)
     _last_pan_key_t = 0.0
+    _last_logged_view = None  # (lat, lon, range_nm) of last VIEWPORT_CHANGE log
 
     rows, cols = stdscr.getmaxyx()
     layout = calc_layout(rows, cols)
@@ -1402,9 +1444,20 @@ def _curses_main(stdscr):
     while True:
         # Flush debounced view-request once inactivity threshold is reached
         if _view_req_pending and time.time() - _last_pan_key_t >= VIEW_DEBOUNCE_S:
-            _send_view_request(*_view_req_args)
+            clat, clon, rnm = _view_req_args
+            _send_view_request(clat, clon, rnm)
             _view_req_pending = False
+            # Log VIEWPORT_CHANGE only when view actually shifted (suppress repeat fires)
+            if _last_logged_view != _view_req_args:
+                _last_logged_view = _view_req_args
+                with _sources_lock:
+                    linked_n = sum(1 for s in _sources.values() if s.get("link") is not None)
+                log.info(
+                    "VIEWPORT_CHANGE  lat=%.3f  lon=%.3f  range=%.0fnm  linked_senders=%d",
+                    clat, clon, rnm, linked_n,
+                )
 
+        _closed_this_cycle: list = []
         while True:
             try:
                 item = _frame_queue.get_nowait()
@@ -1413,6 +1466,7 @@ def _curses_main(stdscr):
             needs_redraw = True
             if isinstance(item, dict) and item.get("type") == "link_closed":
                 src_id = item["src_id"]
+                _closed_this_cycle.append(src_id)
                 with _sources_lock:
                     attempts = _sources.get(src_id, {}).get("_connect_attempts", 0)
                     old_timer = _sources.get(src_id, {}).get("_reconnect_timer")
@@ -1428,6 +1482,8 @@ def _curses_main(stdscr):
                     with _sources_lock:
                         if not _sources.get(sid, {}).get("enabled", True):
                             return
+                        if _sources.get(sid, {}).get("link") is not None:
+                            return  # already reconnected (e.g. via announce) — skip
                         if sid in _sources:
                             _sources[sid]["_reconnect_timer"] = None
                     connect_to_sender(sid)
@@ -1441,7 +1497,25 @@ def _curses_main(stdscr):
             elif isinstance(item, dict) and item.get("type") == "link_up":
                 # Push current viewport to the newly linked sender immediately
                 # so it filters its frames to our window from the first packet.
-                _send_view_request(_home_lat + pan_lat, _home_lon + pan_lon, ZOOM_LEVELS[zoom_idx])
+                clat = _home_lat + pan_lat
+                clon = _home_lon + pan_lon
+                rnm = ZOOM_LEVELS[zoom_idx]
+                _send_view_request(clat, clon, rnm)
+                log.info(
+                    "VIEW_SYNC  src=%s  lat=%.3f  lon=%.3f  range=%.0fnm"
+                    "  (initial viewport pushed on link_up)",
+                    item["src_id"], clat, clon, rnm,
+                )
+
+        # Mass-drop detector: ≥3 senders dropping in one drain cycle is a strong
+        # signal that the local RNS transport job crashed.
+        if len(_closed_this_cycle) >= 3:
+            log.warning(
+                "MESH_EVENT  type=mass_drop  count=%d  senders=%s"
+                "  (simultaneous drops — likely local RNS transport crash)",
+                len(_closed_this_cycle),
+                ",".join(_closed_this_cycle[:8]),
+            )
 
         if needs_redraw:
             stdscr.erase()
@@ -1692,6 +1766,156 @@ def _path_rate_logger():
         )
 
 
+def _announce_staleness_checker():
+    """Daemon thread: warn when an active/connecting sender hasn't re-announced in >3 min."""
+    while True:
+        time.sleep(60)
+        now = time.time()
+        with _sources_lock:
+            snap = [(sid, dict(s)) for sid, s in _sources.items()]
+        for sid, s in snap:
+            if s.get("status") not in ("linked", "linking…", "searching…", "reconnecting…"):
+                continue
+            last_ann = s.get("last_announce_at")
+            if last_ann is None:
+                continue
+            age = now - last_ann
+            if age > 180:
+                log.warning(
+                    "ANNOUNCE_STALE  %s  name=%s  last_announce=%.0fs_ago  status=%s"
+                    "  (sender may have crashed or lost mesh connectivity)",
+                    sid, s.get("name", sid), age, s.get("status"),
+                )
+
+
+def _connection_health_logger():
+    """Daemon thread: log all-sender health summary every 60 seconds."""
+    while True:
+        time.sleep(60)
+        now = time.time()
+        with _sources_lock:
+            snap = [(sid, dict(s)) for sid, s in _sources.items()]
+
+        linked, disconnected, no_path, waiting, other = [], [], [], [], []
+        for sid, s in snap:
+            st = s.get("status", "")
+            if st == "linked":
+                linked.append(sid)
+            elif st == "disconnected":
+                disconnected.append(sid)
+            elif st == "no path":
+                no_path.append(sid)
+            elif st in ("searching…", "linking…", "reconnecting…", "waiting for announce"):
+                waiting.append(sid)
+            else:
+                other.append(sid)
+
+        log.info(
+            "CONN_HEALTH  linked=%d  waiting=%d  disconnected=%d  no_path=%d  other=%d  total=%d",
+            len(linked), len(waiting), len(disconnected), len(no_path), len(other), len(snap),
+        )
+
+        # Flag senders that are flapping (≥3 drops, avg uptime <120s)
+        for sid, s in snap:
+            down = s.get("_link_down_count", 0)
+            total_up = s.get("_total_up_s", 0.0)
+            if down >= 3 and total_up > 0:
+                avg_up = total_up / down
+                if avg_up < 120:
+                    log.warning(
+                        "SENDER_FLAPPING  %s  name=%s  drops=%d  avg_up=%.0fs"
+                        "  (check sender health and mesh path quality)",
+                        sid, s.get("name", sid), down, avg_up,
+                    )
+
+        # Flag senders that have been waiting for a path for a long time
+        if no_path:
+            log.warning(
+                "PATH_UNREACHABLE  senders=%s  (no mesh path found — check if senders are online)",
+                ",".join(no_path),
+            )
+
+
+def _log_rnsd_health():
+    """Pull recent rnsd journal entries and log a startup mesh health summary."""
+    import re as _re
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["journalctl", "-u", "rnsd", "--since", "-120s", "-n", "500", "--no-pager"],
+            capture_output=True, text=True, timeout=5,
+        )
+        lines = result.stdout.splitlines()
+        rnode_errors = sum(1 for ln in lines if "ttyACM0" in ln and "Error" in ln)
+        refused = sum(1 for ln in lines if "Connection refused" in ln)
+        transport_crashes = sum(1 for ln in lines if "An exception occurred while running Transport" in ln)
+        tcp_ips = set(_re.findall(r"TCP Server/(\d+\.\d+\.\d+\.\d+):\d+", result.stdout))
+        interfaces_down = set()
+        for ln in lines:
+            if "Connection refused" in ln:
+                m = _re.search(r"BackboneInterface\[([^\]]+)\]", ln)
+                if m:
+                    interfaces_down.add(m.group(1))
+
+        log.info(
+            "RNSD_HEALTH  tcp_senders=%d  rnode_errors=%d"
+            "  backbone_refused=%d  transport_crashes=%d",
+            len(tcp_ips), rnode_errors, refused, transport_crashes,
+        )
+        if rnode_errors > 0:
+            log.warning(
+                "RNSD_ISSUE  RNode LoRa /dev/ttyACM0 missing (%d errors in last 120s)"
+                " — reconnect USB or check device path",
+                rnode_errors,
+            )
+        if interfaces_down:
+            log.warning(
+                "RNSD_ISSUE  backbone interfaces unreachable: %s",
+                ", ".join(sorted(interfaces_down)),
+            )
+        if transport_crashes > 0:
+            log.warning(
+                "RNSD_ISSUE  RNS transport crashed %d time(s) — links will drop simultaneously"
+                " when this happens; upgrade RNS or reduce announce rate",
+                transport_crashes,
+            )
+    except FileNotFoundError:
+        log.debug("journalctl not available — skipping rnsd health check")
+    except Exception as e:
+        log.debug("Could not read rnsd health: %s", e)
+
+
+def _log_session_summary(session_start: float):
+    """Log per-sender connection stats at receiver shutdown."""
+    duration = time.time() - session_start
+    with _sources_lock:
+        snap = [(sid, dict(s)) for sid, s in _sources.items()]
+    with _aircraft_lock:
+        ac_visible = len(_aircraft_db)
+
+    linked_now = sum(1 for _, s in snap if s.get("status") == "linked")
+    log.info(
+        "SESSION_END  duration=%.0fs  senders_total=%d  senders_linked=%d  ac_visible=%d",
+        duration, len(snap), linked_now, ac_visible,
+    )
+    # Print each sender that ever connected
+    for sid, s in sorted(snap, key=lambda x: x[1].get("_total_up_s", 0.0), reverse=True):
+        total_up = s.get("_total_up_s", 0.0)
+        down = s.get("_link_down_count", 0)
+        up_count = s.get("_link_up_count", 0)
+        bytes_rx = s.get("bytes_rx", 0)
+        name = s.get("name", sid)
+        if up_count == 0 and bytes_rx == 0:
+            continue  # never connected — skip verbose line
+        uptime_pct = (total_up / duration * 100) if duration > 0 else 0
+        log.info(
+            "SENDER_STATS  %s  name=%-12s  up=%.0fs(%.0f%%)  connects=%d  drops=%d"
+            "  bytes_rx=%d  status=%s",
+            sid, name, total_up, uptime_pct, up_count, down, bytes_rx,
+            s.get("status", "?"),
+        )
+
+
 def _register_sender(dest_hex, name=None, status="pending"):
     """Add a sender to _sources without starting a connection thread."""
     dest_hash = bytes.fromhex(dest_hex)
@@ -1714,6 +1938,9 @@ def _register_sender(dest_hex, name=None, status="pending"):
                 "bw_samples": [],
                 "last_announce_at": None,
                 "_reconnect_timer": None,
+                "_link_up_count": 0,
+                "_link_down_count": 0,
+                "_total_up_s": 0.0,
             }
     return src_id
 
@@ -1844,6 +2071,7 @@ def main():
 
     log.info("Connecting to Reticulum …")
     RNS.Reticulum()
+    _session_start = time.time()
 
     log.info(
         "RECEIVER_START  pid=%d  config=%s  home=(%.3f,%.3f)  range=%dnm  known=%d",
@@ -1855,9 +2083,12 @@ def main():
         len(_known_senders),
     )
     _warn_stale_config_hashes()
+    _log_rnsd_health()
 
-    # Start PATH_REQ rate summary logger
+    # Start background daemon threads
     threading.Thread(target=_path_rate_logger, daemon=True).start()
+    threading.Thread(target=_announce_staleness_checker, daemon=True).start()
+    threading.Thread(target=_connection_health_logger, daemon=True).start()
 
     # Register announce handler for auto-discovery of senders on the mesh
     RNS.Transport.register_announce_handler(AdsbAnnounceHandler())
@@ -1924,6 +2155,7 @@ def main():
         curses.wrapper(_curses_main)
     except KeyboardInterrupt:
         pass
+    _log_session_summary(_session_start)
     log.info("Receiver stopped.")
 
 
