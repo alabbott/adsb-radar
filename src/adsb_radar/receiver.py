@@ -1817,11 +1817,15 @@ def _connection_health_logger():
             len(linked), len(waiting), len(disconnected), len(no_path), len(other), len(snap),
         )
 
-        # Flag senders that are flapping (≥3 drops, avg uptime <120s)
+        # Flag senders that are flapping (≥3 drops, avg uptime <120s).
+        # Only warn when new drops have occurred since last warning to prevent
+        # the same warning from firing every 60s indefinitely.
+        flapping_sids = []
         for sid, s in snap:
             down = s.get("_link_down_count", 0)
             total_up = s.get("_total_up_s", 0.0)
-            if down >= 3 and total_up > 0:
+            last_warned = s.get("_flapping_warned_at_drops", 0)
+            if down >= 3 and total_up > 0 and down > last_warned:
                 avg_up = total_up / down
                 if avg_up < 120:
                     log.warning(
@@ -1829,6 +1833,12 @@ def _connection_health_logger():
                         "  (check sender health and mesh path quality)",
                         sid, s.get("name", sid), down, avg_up,
                     )
+                    flapping_sids.append((sid, down))
+        if flapping_sids:
+            with _sources_lock:
+                for sid, down in flapping_sids:
+                    if sid in _sources:
+                        _sources[sid]["_flapping_warned_at_drops"] = down
 
         # Flag senders that have been waiting for a path for a long time
         if no_path:
