@@ -375,7 +375,7 @@ def main():
                 n_sent,
                 _link_count(),
             )
-        except URLError as e:
+        except (URLError, TimeoutError, OSError) as e:
             fetch_failures += 1
             backoff = min(FETCH_MAX_BACKOFF, args.interval * (2 ** (fetch_failures - 1)))
             log.warning("Fetch error (attempt %d, retry in %.0fs): %s", fetch_failures, backoff, e)
