@@ -1,5 +1,9 @@
 # adsb-radar
 
+> **Note:** This project was developed through AI-assisted ("vibe coded") iteration using Claude. The code works, but the architecture and internals reflect an exploratory, conversational development process rather than deliberate upfront design.
+>
+> A ground-up rewrite with a cleaner architecture is in progress at **[alabbott/adsb-rns](https://github.com/alabbott/adsb-rns)**. If you're evaluating this for serious use or contributions, that's the version to watch.
+
 ADS-B radar shared over a [Reticulum](https://reticulum.network) mesh. Senders read aircraft from a local dump1090 or a public API and broadcast filtered frames over encrypted RNS links. Receivers display a merged terminal radar scope and discover senders automatically via announce.
 
 <img src="docs/demo.gif" alt="adsb-radar live scope demo" width="900">
